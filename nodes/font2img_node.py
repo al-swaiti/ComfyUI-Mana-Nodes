@@ -6,6 +6,8 @@ import torch
 from torchvision import transforms
 from matplotlib import font_manager
 import re
+import arabic_reshaper
+from bidi.algorithm import get_display
 
 class font2img:
 
@@ -40,11 +42,7 @@ class font2img:
     def combined_font_list(self):
         system_fonts = self.system_font_names()
         custom_font_files = self.setup_font_directories()
-
-        # Create a dictionary for custom fonts mapping font file base names to their paths
         custom_fonts = {os.path.splitext(os.path.basename(f))[0]: f for f in custom_font_files}
-
-        # Merge system_fonts and custom_fonts dictionaries
         all_fonts = {**system_fonts, **custom_fonts}
         return all_fonts
     
@@ -54,7 +52,6 @@ class font2img:
 
     @classmethod
     def INPUT_TYPES(self):
-
         self.FONTS = self.combined_font_list()
         self.FONT_NAMES = sorted(self.FONTS.keys())
         return {
@@ -91,7 +88,7 @@ class font2img:
         frame_text_dict, is_structured_input = self.parse_text_input(text, kwargs)
         frame_text_dict = self.cumulative_text(frame_text_dict, frame_count)
         
-        images = self.generate_images(frame_text_dict,images , kwargs)
+        images = self.generate_images(frame_text_dict, images, kwargs)
         image_batch = torch.cat(images, dim=0)
 
         return (image_batch, formatted_transcription,)
@@ -492,48 +489,36 @@ class font2img:
         main_font_kerning = kwargs['font']['kerning'][0]
         line_spacing = kwargs['canvas']['line_spacing']
 
+        # Reshape and reorder Arabic text
+        reshaped_text = arabic_reshaper.reshape(text)
+        bidi_text = get_display(reshaped_text)
+
         y_text_overlay = 0
         x_text_overlay = main_border_width
 
-        tag_start = "<tag>"
-        tag_end = "</tag>"
+        for line in bidi_text.split('\n'):
+            line_width = draw_overlay.textlength(line, font=font)
+            x_text_overlay = main_border_width
 
-        is_inside_tag = False
-        current_font = font
-       
-        for line in text.split('\n'):
-            while line:
-                if line.startswith(tag_start):
-                    line = line[len(tag_start):]
-                    is_inside_tag = True
-                    current_font = tagged_font
-                    continue
-
-                if line.startswith(tag_end):
-                    line = line[len(tag_end):]
-                    is_inside_tag = False
-                    current_font = font
-                    continue
-
-                char = line[0]
-                line = line[1:]
-
+            for char in line:
                 # Adjust vertical position for tagged text
+                if char in ('<', '>', '/'):  # Skip tag characters
+                    continue
+
+                is_inside_tag = char.isalnum()  # Simplified tag detection
+                current_font = tagged_font if is_inside_tag else font
+
                 if is_inside_tag:
                     ascent, descent = current_font.getmetrics()
                     font_offset = (font.getmetrics()[0] - ascent) + (descent - current_font.getmetrics()[1])
-                else:
-                    font_offset = 0
-
-                if is_inside_tag:
                     border_width = tagged_border_width
                     border_color = tagged_border_color
                     shadow_offset_x = tagged_shadow_offset_x
                     shadow_offset_y = tagged_shadow_offset_y
                     shadow_color = tagged_shadow_color
                     font_color = tagged_font_color
-
                 else:
+                    font_offset = 0
                     border_width = main_border_width
                     border_color = main_border_color
                     shadow_offset_x = main_shadow_offset_x
@@ -547,11 +532,9 @@ class font2img:
 
                 # Draw the shadow
                 draw_overlay.text(
-                    (x_text_overlay + shadow_offset_x, y_text_overlay + shadow_offset_y + font_offset),
+                    (shadow_x, shadow_y),
                     char, font=current_font, fill=shadow_color
                 )
-
-                draw_overlay.text((shadow_x, shadow_y), char, font=current_font, fill=shadow_color)
 
                 # Draw the border/stroke
                 for dx in range(-border_width, border_width + 1):
@@ -573,14 +556,12 @@ class font2img:
                 x_text_overlay += char_width + main_font_kerning
 
             # Reset x position and increase y for next line
-            x_text_overlay = main_border_width
-            y_text_overlay +=  current_font.getbbox('Agy')[3] + line_spacing
+            y_text_overlay += current_font.getbbox('Agy')[3] + line_spacing
 
         # Consider adding padding for the right border
         draw_overlay.text((x_text_overlay, y_text_overlay), '', font=font, fill=border_color)
 
     def get_text_width(self, text, kwargs):
-        
         main_font = kwargs['font']
         main_font_size = main_font['font_size'][0]
         main_font_file = main_font['font_file']
@@ -593,8 +574,12 @@ class font2img:
         # Load the font
         font = self.get_font(main_font_file, main_font_size)
 
+        # Reshape and reorder Arabic text
+        reshaped_text = arabic_reshaper.reshape(text)
+        bidi_text = get_display(reshaped_text)
+
         # Measure the size of the text rendered in the loaded font
-        text_width = font.getlength(text)
+        text_width = font.getlength(bidi_text)
         return text_width
 
     def calculate_text_position(self, text_width, text_height, x_offset, y_offset, kwargs):
@@ -603,34 +588,29 @@ class font2img:
         image_height = kwargs['canvas']['height']
         padding = kwargs['canvas']['padding']
 
+        # Check if the text is RTL
+        is_rtl = any(ord(char) in range(0x0600, 0x06FF) for char in kwargs.get('text', ''))
+
         # Adjust the base position based on text_alignment and margin
-        if text_alignment == "left top":
-            base_x, base_y = padding, padding
-        elif text_alignment == "left center":
-            base_x, base_y = padding, padding + (image_height - text_height) // 2
-        elif text_alignment == "left bottom":
-            base_x, base_y = padding, image_height - text_height - padding
-        elif text_alignment == "center top":
-            base_x, base_y = (image_width - text_width) // 2, padding
-        elif text_alignment == "center center":
-            base_x, base_y = (image_width - text_width) // 2, (image_height - text_height) // 2
-        elif text_alignment == "center bottom":
-            base_x, base_y = (image_width - text_width) // 2, image_height - text_height - padding
-        elif text_alignment == "right top":
-            base_x, base_y = image_width - text_width - padding, padding
-        elif text_alignment == "right center":
-            base_x, base_y = image_width - text_width - padding, (image_height - text_height) // 2
-        elif text_alignment == "right bottom":
-            base_x, base_y = image_width - text_width - padding, image_height - text_height - padding
-        else:  # Default to center center
-            base_x, base_y = (image_width - text_width) // 2, (image_height - text_height) // 2
+        if text_alignment.startswith("left"):
+            base_x = padding if not is_rtl else image_width - text_width - padding
+        elif text_alignment.startswith("right"):
+            base_x = image_width - text_width - padding if not is_rtl else padding
+        else:  # center
+            base_x = (image_width - text_width) // 2
+
+        if text_alignment.endswith("top"):
+            base_y = padding
+        elif text_alignment.endswith("bottom"):
+            base_y = image_height - text_height - padding
+        else:  # center
+            base_y = (image_height - text_height) // 2
 
         # Apply offsets
         final_x = base_x + x_offset
         final_y = base_y + y_offset
 
         return final_x, final_y
-
     def process_image_for_output(self, image) -> torch.Tensor:
         i = ImageOps.exif_transpose(image)
         if i.mode == 'I':
@@ -640,19 +620,17 @@ class font2img:
         return torch.from_numpy(image_np)[None,]
 
     def calculate_text_block_size(self, draw, text, font, tagged_font, kwargs):
-        lines = text.split('\n')
+        reshaped_text = arabic_reshaper.reshape(text)
+        bidi_text = get_display(reshaped_text)
+        lines = bidi_text.split('\n')
         max_width = 0
-        font_height = font.getbbox('Agy')[3] # Height of a single line
+        font_height = font.getbbox('Agy')[3]  # Height of a single line
         tagged_font_height = tagged_font.getbbox('Agy')[3]
         line_spacing = kwargs['canvas']['line_spacing']
 
         for line in lines:
-            non_tagged_text, tagged_text = self.separate_text(line)
-            line_width = draw.textlength(non_tagged_text, font=font)
-            tagged_line_width = draw.textlength(tagged_text, font=tagged_font)
-
-            total_line_width = line_width + tagged_line_width
-            max_width = max(max_width, total_line_width)
+            line_width = draw.textlength(line, font=font)
+            max_width = max(max_width, line_width)
 
         total_height = max(font_height, tagged_font_height) * len(lines) + line_spacing * (len(lines) - 1)
         return max_width, total_height
